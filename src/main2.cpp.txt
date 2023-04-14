@@ -1,0 +1,483 @@
+// nRF24L01
+#include <RF24.h>
+#include <SPI.h>
+#include <nRF24L01.h>
+// ble
+#include <BLE2902.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+// utils
+#include <string.h>
+#include "Arduino.h"
+#include "esp_sleep.h"
+#include "printf.h"
+#include "sys/time.h"
+// wifi
+// #include <WiFi.h>
+// hash - sha1
+// #include "ArduinoBearSSL.h"
+// #include "ArduinoBearSSLConfig.h"
+// #include "Hash.h"
+// eeprom
+// linked list
+#include "listenc.h"
+// file
+#include "SPIFFS.h"
+#include "FS.h"
+/* VARIABLES */
+
+// version
+const uint16_t version = 100;  // 1.0.0
+
+// ble
+BLEServer *pServer = NULL;
+BLEAdvertising *pAdvertising;
+BLECharacteristic *pCharacteristic = NULL;
+#define PASSKEY 999999  // !!!!!! PASSKEY CONNECT TO BLE
+bool deviceConnected = false;
+int connId = -1;
+
+// hash
+// uint8_t               hash[20];
+
+#define LENGTH_RADIOADRRESS 5
+#define MAX_ADDRESS 255
+
+struct Address {
+  unsigned char idEquipments[MAX_ADDRESS][LENGTH_RADIOADRRESS] = {0};
+};
+
+const char *filename = "/address.txt";  // <- SD library uses 8.3 filenames
+Address address; 
+// equipments - get by BLE
+// static std::string    equipments("SHOULDER PRESS,ABDOMINAL,REMADA");
+
+// i = number to call: [0] = 1 ... [254] = 255 (id)
+// byte 0-3 = radio address equipment
+
+// See the following for generating UUIDs:
+// https://www.uuidgenerator.net/
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// nRF24L01
+#define CE_PIN 17
+#define CSN_PIN 16
+// instantiate an object for the nRF24L01 transceiver
+RF24 radio(CE_PIN,
+           CSN_PIN);  // using pin 22 for the CE pin, and pin 21 for the CSN pin
+uint8_t RxAddresses[][6] = {"2Node"};  // gateway address
+// uint8_t RxAddresses[][6] = {"MOVTX"};
+
+// debug
+// char buffer[880];
+
+// data
+char myRxData[32] = {0};
+char myAckPayload[32] = "OK";
+
+// list
+TLista lista;
+
+// FreeRTOS
+TaskHandle_t *TaskOnApp;
+TaskHandle_t *TaskOnPro;
+
+// Prototypes
+void TaskRunningOnProtocolCore(void *arg);
+void TaskRunningOnAppCore(void *arg);
+
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {};
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) {
+    if (pServer->getConnectedCount() == 1) {
+      pServer->disconnect(pServer->getConnId());
+      // Serial.println("Only 1 connected allow");
+      return;
+    }
+
+    // Serial.println("Dispositivo Conectado!");
+
+    deviceConnected = true;
+    connId = pServer->getConnId();
+    // BLEDevice::startAdvertising();
+    BLEDevice::stopAdvertising();
+  };
+
+  void onDisconnect(BLEServer *pServer) {
+    // Serial.print("Dispositivo desconectado!");
+    deviceConnected = false;
+    connId = -1;
+
+    BLEDevice::startAdvertising();
+  }
+};
+
+class SecurityCallback : public BLESecurityCallbacks {
+  uint32_t onPassKeyRequest() { return 000000; }
+
+  void onPassKeyNotify(uint32_t pass_key) {}
+
+  bool onConfirmPIN(uint32_t pass_key) {
+    vTaskDelay(5000);
+    return true;
+  }
+
+  bool onSecurityRequest() { return true; }
+
+  void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
+    if (cmpl.success) {
+      Serial.println("   - SecurityCallback - Authentication Success");
+    } else {
+      Serial.println("   - SecurityCallback - Authentication Failure*");
+      pServer->removePeerDevice(pServer->getConnId(), true);
+    }
+
+    BLEDevice::startAdvertising();
+  }
+};
+
+void ble_Security() {
+  esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_MITM_BOND;
+  esp_ble_io_cap_t iocap = ESP_IO_CAP_OUT;
+
+  uint8_t key_size = 16;
+  uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+  uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+  uint32_t passkey = PASSKEY;
+  uint8_t auth_option = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_DISABLE;
+
+  esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &passkey,
+                                 sizeof(uint32_t));
+  esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req,
+                                 sizeof(uint8_t));
+  esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap,
+                                 sizeof(uint8_t));
+  esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size,
+                                 sizeof(uint8_t));
+  esp_ble_gap_set_security_param(ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH,
+                                 &auth_option, sizeof(uint8_t));
+  esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key,
+                                 sizeof(uint8_t));
+  esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key,
+                                 sizeof(uint8_t));
+}
+
+// void wifi_INIT() {
+//   Serial.print(wifi_SSID.length());
+//   if (!wifi_SSID.isEmpty() && !wifi_Password.isEmpty() &&
+//       wifi_SSID.length() <= 32 && wifi_Password.length() <= 64) {
+//     WiFi.mode(WIFI_STA);
+//     WiFi.begin(wifi_SSID.c_str(), wifi_SSID.c_str());
+//     Serial.print("Connecting to WiFi ..");
+//     while (WiFi.status() != WL_CONNECTED) {
+//       delay(1000);
+//     }
+//     Serial.println(WiFi.localIP());
+//   }
+// }
+
+void debug_AddressEquip() {
+  for (int i = 0; i < MAX_ADDRESS; i++) {
+    for (int j = 0; j < LENGTH_RADIOADRRESS; j++) {
+      Serial.printf("%x", address.idEquipments[i][j]);
+    }
+    Serial.println();
+  }
+}
+
+void spifss_readAdrress() {
+  // file
+  File file = SPIFFS.open("/address.txt");
+
+  char inputc = 0;
+  int id = 0;
+  unsigned char store_adrress[LENGTH_RADIOADRRESS] = {0};
+  std::string buffer;
+
+  buffer.clear();
+
+  while (file.available()) {
+    inputc = file.read();
+    Serial.print(inputc);
+    if (inputc == '\n') {
+      if (sscanf(buffer.c_str(), "%d,%s", &id, store_adrress) == 2)
+        memcpy(address.idEquipments[id - 1], store_adrress, LENGTH_RADIOADRRESS);
+      buffer.clear();
+    } else
+      buffer += inputc;
+  }
+
+  if (buffer.length() != 0) {
+    if (sscanf(buffer.c_str(), "%d,%s", &id, store_adrress) == 2)
+      memcpy(address.idEquipments[id - 1], store_adrress, LENGTH_RADIOADRRESS);
+  }
+  
+  file.close();
+  Serial.println("Salvou");
+}
+
+void spifss_updateAdrress() {
+  
+  File file;
+  unsigned char adrress[LENGTH_RADIOADRRESS] = {
+      "\x35\x35\x35\x35"};  // get by parameter
+  int line = 0;
+  int lineFound = -1;
+
+  // search
+  char inputc = 0;
+  int id = 0;
+  unsigned char store_adrress[LENGTH_RADIOADRRESS] = {0};
+  std::string buffer;
+  buffer.clear();
+
+  file = SPIFFS.open("/address.txt", FILE_READ);
+  while (file.available()) {
+    inputc = file.read();
+    if (inputc == '\n') {
+      line++;
+      if (sscanf(buffer.c_str(), "%d,%s", &id, store_adrress) == 2)
+        if (memcmp(store_adrress, adrress, LENGTH_RADIOADRRESS) == 0) {
+          Serial.printf("Encontrou! Linha: %d", line);
+          lineFound = line;
+          buffer.clear();
+          break;
+        }
+      buffer.clear();
+    } else
+      buffer += inputc;
+  }
+
+  if (buffer.length() != 0) {
+    line++;
+    if (sscanf(buffer.c_str(), "%d,%s", &id, store_adrress) == 2)
+      if (memcmp(store_adrress, adrress, LENGTH_RADIOADRRESS) == 0) {
+        Serial.printf("Encontrou! Linha: %d", line);
+        lineFound = line;
+        buffer.clear();
+      }
+  }
+
+  file.close();
+
+  file = SPIFFS.open("/address.txt", FILE_APPEND);
+  file.flush();
+  // Serial.printf("Posi: %d", lineFound);
+  // append or replace
+  if (lineFound == -1) {
+
+    if(file.print("\x30\x30\x35\x2C\x35\x35\x35\x35"))
+      Serial.println("save address sucess");
+  
+  } else {
+
+    //file.seek(0,SEEK_SET);
+    if(file.print("\x30\x30\x36\x2C\x35\x35\x35\x36"))
+      Serial.println("update address sucess");
+
+  }
+  file.close();
+  Serial.println("save/update address exit");
+}
+
+void spifss_INIT() {
+  
+  if (!SPIFFS.begin(true)) {
+    Serial.println("An Error has occurred while mounting SPIFFS");
+    return;
+  }
+
+  spifss_readAdrress();
+  debug_AddressEquip();
+}
+
+void ble_INIT() {
+  // Create the BLE Device
+  BLEDevice::init("ESP32GTW");
+  BLEDevice::setPower(ESP_PWR_LVL_P9, ESP_BLE_PWR_TYPE_ADV);
+  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+  BLEDevice::setSecurityCallbacks(new SecurityCallback());
+
+  Serial.println("Starting BLE!");
+  // Create the BLE Server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  // Create the BLE Service
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  // Create a BLE Characteristic
+  pCharacteristic = pService->createCharacteristic(
+      CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ |
+                               BLECharacteristic::PROPERTY_WRITE |
+                               BLECharacteristic::PROPERTY_NOTIFY);
+
+  pCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED |
+                                        ESP_GATT_PERM_WRITE_ENCRYPTED);
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+  // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
+  // Create a BLE Descriptor
+  pCharacteristic->addDescriptor(new BLE2902());
+  // pCharacteristic->setValue("Hello World says Neil");
+
+  // Start the service
+  pService->start();
+
+  // Start advertising
+  pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setAdvertisementType(ADV_TYPE_IND);
+  pAdvertising->setMinPreferred(
+      0x0);  // set value to 0x00 to not advertise this parameter
+
+  BLEDevice::startAdvertising();
+  ble_Security();
+  Serial.println("Waiting a client connection to update the configs...");
+}
+
+void radio_INIT() {
+  if (!radio.begin()) {
+    Serial.println(F("radio hardware is not responding!!"));
+    while (1) {
+    }  // hold in infinite loop
+  }
+
+  radio.setChannel(15);
+  radio.setDataRate(RF24_2MBPS);
+  radio.setPALevel(RF24_PA_MAX);
+  radio.enableAckPayload();
+  radio.enableDynamicPayloads();
+
+  // set the RX addres of the TX node into a RX pipe
+  radio.openReadingPipe(1, RxAddresses[0]);  // using pipe 1
+  // radio.openReadingPipe(2, RxAddresses[1]); // using pipe 2
+
+  radio.startListening();  // put radio in RX mode
+
+  // Debug
+  // uint16_t used_chars = radio.sprintfPrettyDetails(buffer);
+  // Serial.println(buffer);
+}
+
+int incomingByte = 0;
+void TaskRunningOnProtocolCore(void *arg) {
+  while (1) {
+    if (Serial.available() > 0) {
+      // read the incoming byte:
+      incomingByte = Serial.read();
+
+      // say what you got:
+      Serial.print("I received: ");
+      Serial.println(incomingByte, DEC);
+      if(incomingByte==49)
+        spifss_updateAdrress();
+      else if(incomingByte==50)
+        ESP.restart();
+    }
+    delay(500);
+  }
+}
+
+void TaskRunningOnAppCore(void *arg) {
+  while (1) {
+    uint8_t pipe;
+
+    if (radio.available(&pipe)) {
+      if (radio.writeAckPayload(pipe, &myAckPayload, sizeof(myAckPayload)))
+        Serial.println("ACK Success");
+      else {
+        Serial.println("ACK Fail");
+        radio.flush_tx();
+        radio.writeAckPayload(pipe, &myAckPayload, sizeof(myAckPayload));
+      }
+
+      radio.read(&myRxData, sizeof(myRxData));  // get incoming payload
+
+      /* Protocol
+        myRxData[0] == '0' -> cancel help request
+        myRxData[0] == '1' -> help request
+        myRxData[0] == '2' -> set up address/id equipment
+      */
+
+      if (myRxData[0] == '2') {
+      }
+
+      int id = 0;
+
+      // debug
+      // Serial.printf("dataRX[0]: %x\n\r",myRxData[0]);
+      // Serial.printf("dataRX[1]: %x\n\r",myRxData[1]);
+      // Serial.printf("dataRX[2]: %x\n\r",myRxData[2]);
+      // Serial.printf("dataRX[3]: %x\n\r",myRxData[3]);
+      // Serial.printf("dataRX[4]: %x\n\r",myRxData[4]);
+      // Serial.printf("dataRX[5]: %x\n\r",myRxData[5]);
+
+      for (int l = 0; l < 255; l++) {
+        if ((unsigned char)myRxData[1] == address.idEquipments[l][0] &&
+            (unsigned char)myRxData[2] == address.idEquipments[l][1] &&
+            (unsigned char)myRxData[3] == address.idEquipments[l][2] &&
+            (unsigned char)myRxData[4] == address.idEquipments[l][3]) {
+          id = address.idEquipments[l][0];
+          break;
+        }
+      }
+
+      if (id == 0) return;
+
+      // cancel and remove help request
+      if (myRxData[0] == '0') {
+        Serial.print("Ajuda Máquina (cancelada): ");
+        Serial.println(id);
+        id = indexLista(lista, id);
+        if (id != -1) {
+          removeLista(lista, id);
+          imprimeLista(lista);
+        }
+
+        // help request
+      } else if (myRxData[0] == '1') {
+        Serial.print("Ajuda Máquina: ");
+        Serial.println(id);
+        id = indexLista(lista, id);
+        if (id == -1) {
+          lista = appendLista(lista, id);
+        }
+        imprimeLista(lista);
+      }
+    }
+    delay(1);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  // list
+  lista = criaLista();
+
+  // usage as ptr - SHA1
+  // sha1((const uint8_t *)equipments.c_str(), equipments.length(), &hash[0]);
+  // Serial.print("SHA1:");
+  // for (uint16_t i = 0; i < 20; i++) {
+  //   Serial.printf("%02x", hash[i]);
+  // }
+  // Serial.println();
+  spifss_INIT();
+  ble_INIT();
+  radio_INIT();
+  // wifi_INIT();
+
+  Serial.println("Version: " + String(version));
+
+  xTaskCreatePinnedToCore(TaskRunningOnAppCore, "TaskOnApp", 4096, NULL, 4,
+                          TaskOnApp, APP_CPU_NUM);
+
+  xTaskCreatePinnedToCore(TaskRunningOnProtocolCore, "TaskOnPro", 4096, NULL, 4,
+                          TaskOnPro, PRO_CPU_NUM);
+}
+
+/**
+ * @brief Disable -> Implemented tasks
+ */
+void loop() {}

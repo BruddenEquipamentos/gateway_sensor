@@ -1,0 +1,359 @@
+// NRF24L01
+#include <RF24.h>
+#include <SPI.h>
+#include <nRF24L01.h>
+
+#include "printf.h"
+// BLE
+#include <BLE2902.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+
+#include "Arduino.h"
+#include "esp_sleep.h"
+#include "sys/time.h"
+// SHA1
+#include "ArduinoBearSSL.h"
+#include "ArduinoBearSSLConfig.h"
+#include "Hash.h"
+// LISTA ENCADEADA
+#include "listenc.h"
+//#include "fila.h"
+
+// BLE
+BLEAdvertisementData oAdvertisementData;
+BLEServer *pServer = NULL;
+BLEAdvertising *pAdvertising;
+BLECharacteristic *pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+int connId = -1;
+// Transmissions
+bool deviceUpdate = false;
+int ackCount = 0;
+// Hash
+uint8_t hash[20];
+
+static std::string equipments(
+    "SHOULDER PRESS,ABDOMINAL,REMADA");
+
+static unsigned char idEquipments[255][6] = {"\x00\x00\x00\x03\xE8", "\x00\x04\xA2\xC8\x68", "\x00\x05\x4C\x52\xC0"};
+
+// See the following for generating UUIDs:
+// https://www.uuidgenerator.net/
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// NRF24L01
+#define CE_PIN 22
+#define CSN_PIN 21
+// instantiate an object for the nRF24L01 transceiver
+RF24 radio(CE_PIN,
+           CSN_PIN);  // using pin 22 for the CE pin, and pin 21 for the CSN pin
+uint8_t RxAddresses[][6] = {"2Node"};
+//uint8_t RxAddresses[][6] = {"MOVTX"};
+
+// Debug
+//char buffer[880];
+
+// Data
+char myRxData[32] = {0};
+char myAckPayload[32] = "OK";
+// Lista
+TLista lista;
+uint8_t version = 1;
+
+bool updateDevice(bool fail);
+void disconnectDevice();
+
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onStatus(BLECharacteristic *pCharacteristic, Status s, uint32_t code) {
+    if (s == SUCCESS_INDICATE) {
+      // Serial.println("ACK Receveid!");
+      ackCount++;
+      // pServer->disconnect(connId);
+      // connId = -1;
+    }
+    // else
+    // Serial.println("ACK Fail");
+  }
+};
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) {
+    if (pServer->getConnectedCount() == 1) {
+      pServer->disconnect(pServer->getConnId());
+      Serial.println("Only 1 connected allow");
+    }
+
+    Serial.println("Dispositivo Conectado!");
+    deviceConnected = true;
+    connId = pServer->getConnId();
+    // BLEDevice::startAdvertising();
+    BLEDevice::stopAdvertising();
+  };
+
+  void onDisconnect(BLEServer *pServer) {
+    Serial.print("Dispositivo desconectado!");
+    deviceConnected = false;
+    deviceUpdate = false;
+    connId = -1;
+    ackCount = 0;
+    BLEDevice::startAdvertising();
+  }
+};
+
+bool updateDevice(bool fail) {
+  Serial.println("Updating...");
+  if (fail) {
+    // Send commando to clear string in client ( +1 packet (block) )
+    pCharacteristic->setValue("CLEAR");
+    pCharacteristic->indicate();
+    delay(10);
+  }
+  int blocks = ceil((float)equipments.length() / 20);
+  char packet[20];
+  for (int i = 0; i < blocks; i++) {
+    std::size_t length = equipments.copy(packet, 20, 20 * i);
+    packet[length] = '\0';
+    // equipments.substring(i * 20, (i + 1) * 20).toCharArray(packet, 20);
+    pCharacteristic->setValue(packet);
+    pCharacteristic->indicate();
+    delay(10);
+  }
+  // Send HASHSHA1: ( +2 packets (blocks) )
+  strcpy(packet, "HASHSHA1:");
+  pCharacteristic->setValue(packet);
+  pCharacteristic->indicate();
+  delay(10);
+  // strcpy(packet,(char *)hash);
+  std::string hash1((char *)hash);
+  Serial.println("OI: ");
+  Serial.println(hash1.c_str());
+  pCharacteristic->setValue(hash1);
+  pCharacteristic->indicate();
+  delay(10);
+  // Update Successfully -> Disconnect Device
+  if (fail)
+    if (ackCount == blocks + 3) {
+      Serial.println("Update Successfully!");
+      return true;
+    }
+  if (ackCount == blocks + 2) {
+    Serial.println("Update Successfully!");
+    return true;
+  }
+  ackCount = 0;
+  Serial.println("Update Fail!");
+  return false;
+}
+
+void disconnectDevice() {
+  pServer->disconnect(connId);
+  deviceConnected = false;
+  deviceUpdate = false;
+  connId = -1;
+  ackCount = 0;
+}
+
+void ble_INIT() {
+  // Create the BLE Device
+  BLEDevice::init("ESP32GTW");
+  BLEDevice::setPower(ESP_PWR_LVL_P9, ESP_BLE_PWR_TYPE_ADV);
+  Serial.println("Starting BLE!");
+  // Create the BLE Server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  // Create the BLE Service
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  // Create a BLE Characteristic
+  pCharacteristic =
+      pService->createCharacteristic(CHARACTERISTIC_UUID,
+                                     // BLECharacteristic::PROPERTY_READ |
+                                     // BLECharacteristic::PROPERTY_WRITE |
+                                     // BLECharacteristic::PROPERTY_NOTIFY |
+                                     BLECharacteristic::PROPERTY_INDICATE);
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+  // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
+  // Create a BLE Descriptor
+  pCharacteristic->addDescriptor(new BLE2902());
+  // pCharacteristic->setValue("Hello World says Neil");
+
+  // Start the service
+  pService->start();
+
+  // Start advertising
+  pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setAdvertisementType(ADV_TYPE_IND);
+  pAdvertising->setMinPreferred(
+      0x0);  // set value to 0x00 to not advertise this parameter
+  // BLEAdvertisementData oAdvertisementData = BLEAdvertisementData();
+  oAdvertisementData = BLEAdvertisementData();
+
+  std::string strServiceData = "";
+  strServiceData += (char)30;    // Len
+  strServiceData += (char)0xFF;  // Type
+  strServiceData += (char)version;
+  for (int i = 0; i < 28; i++) strServiceData += (char)0x00;
+  oAdvertisementData.addData(strServiceData);
+  pAdvertising->setAdvertisementData(oAdvertisementData);
+
+  BLEDevice::startAdvertising();
+  Serial.println("Waiting a client connection to update...");
+}
+
+void radio_INIT() {
+  if (!radio.begin()) {
+    Serial.println(F("radio hardware is not responding!!"));
+    while (1) {
+    }  // hold in infinite loop
+  }
+
+  radio.setChannel(15);
+  radio.setDataRate(RF24_2MBPS);
+  radio.setPALevel(RF24_PA_MAX);
+  radio.enableAckPayload();
+  radio.enableDynamicPayloads();
+
+  // set the RX addres of the TX node into a RX pipe
+  radio.openReadingPipe(1, RxAddresses[0]);  // using pipe 1
+  // radio.openReadingPipe(2, RxAddresses[1]); // using pipe 2
+
+  radio.startListening();  // put radio in RX mode
+
+  // Debug
+  //uint16_t used_chars = radio.sprintfPrettyDetails(buffer);
+  //Serial.println(buffer);
+}
+
+void setup() {
+  Serial.begin(115200);
+  // FILA
+  // inicializa(&fi);
+  // LISTA
+  lista = criaLista();
+
+  // usage as ptr - SHA1
+  sha1((const uint8_t *)equipments.c_str(), equipments.length(), &hash[0]);
+  Serial.print("SHA1:");
+  for (uint16_t i = 0; i < 20; i++) {
+    Serial.printf("%02x", hash[i]);
+  }
+  Serial.println();
+
+  ble_INIT();
+  radio_INIT();
+
+  Serial.println("Versão 2.0");
+}
+
+void loop() {
+  uint8_t pipe;
+  // device connected -> send data equipments
+  if (deviceConnected) {
+    Serial.print(pServer->getConnId());
+    Serial.print(pServer->getConnectedCount());
+    if (!deviceUpdate) {
+      int tries = 0;
+      bool fail = false;
+      while (tries < 5) {
+        delay(1000);
+        deviceUpdate = updateDevice(fail);
+        if (deviceUpdate) break;
+        if (!deviceConnected) break;
+        delay(2000);
+        fail = true;
+        tries++;
+      }
+      disconnectDevice();
+    }
+  }
+
+  if (radio.available(&pipe)) {
+    if (radio.writeAckPayload(pipe, &myAckPayload, sizeof(myAckPayload)))
+      Serial.println("ACK Success");
+    else {
+      Serial.println("ACK Fail");
+      radio.flush_tx();
+      radio.writeAckPayload(pipe, &myAckPayload, sizeof(myAckPayload));
+    }
+
+    radio.read(&myRxData, sizeof(myRxData));  // get incoming payload
+    
+    int id = 0;
+    int h = 0;
+
+    // Serial.printf("dataRX[0]: %x\n\r",myRxData[0]);
+    // Serial.printf("dataRX[1]: %x\n\r",myRxData[1]);
+    // Serial.printf("dataRX[2]: %x\n\r",myRxData[2]);
+    // Serial.printf("dataRX[3]: %x\n\r",myRxData[3]);
+    // Serial.printf("dataRX[4]: %x\n\r",myRxData[4]);
+    // Serial.printf("dataRX[5]: %x\n\r",myRxData[5]);
+
+    for(int l=0;l<255;l++){
+		  if( (unsigned char)myRxData[1]==idEquipments[l][0] &&
+			    (unsigned char)myRxData[2]==idEquipments[l][1] &&
+			    (unsigned char)myRxData[3]==idEquipments[l][2] &&
+			    (unsigned char)myRxData[4]==idEquipments[l][3] &&
+			    (unsigned char)myRxData[5]==idEquipments[l][4]){
+            h = l+1;
+            break;  
+        }
+    }
+
+    if(h==0)
+      return;
+
+    if (myRxData[0] == '0') {
+      Serial.print("Ajuda Máquina (cancelada): ");
+      Serial.println(h);
+      id = indexLista(lista, h);
+      if (id != -1) {
+        removeLista(lista, id);
+        imprimeLista(lista);
+      }
+    } else if (myRxData[0]=='1') {
+      Serial.print("Ajuda Máquina: ");
+      Serial.println(h);
+      id = indexLista(lista, h);
+      if (id == -1) {
+        if (lista->tamanho == 28) {
+          Serial.print("Remove...");
+          removeLista(lista, 0);
+        }
+        lista = appendLista(lista, h);
+        Serial.print("Tamanho Lista: ");
+        Serial.println(lista->tamanho);
+      }
+      imprimeLista(lista);
+    }
+
+    // BLE
+    /**
+     * @attention attention text
+        void BLEAdvertisementData::clear() {
+	        m_payload.clear();
+        }
+     */
+    oAdvertisementData.clear();
+    std::string strServiceData = "";
+    int i = 0;
+    int n = lista->tamanho;
+    //Serial.println(n);
+    strServiceData += (char)30;    // Len
+    strServiceData += (char)0xFF;  // Type
+    strServiceData += (char)version;
+    pnoh aux;
+    for (i = 0; i < lista->tamanho; i++) {
+      aux = infoLista(lista, i);
+      strServiceData += (char)aux->id;
+    }
+    for (i = 0; i < 28 - lista->tamanho; i++) strServiceData += (char)0x00;
+    oAdvertisementData.addData(strServiceData);
+    pAdvertising->setAdvertisementData(oAdvertisementData);
+  
+  }
+}
